@@ -1,182 +1,234 @@
-import os
 import re
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from supabase import create_client, Client
-from thefuzz import process, fuzz
 
-TELEGRAM_TOKEN = "8773479891:AAEdB5WaInEhiRxeff4Lgwj3MzEWIkPifKY"
+# 1. إعدادات الاتصال (Supabase) المأخوذة من الموقع المرفق
 SUPABASE_URL = "https://ztcubxsgkspmjnuvamve.supabase.co"
-SUPABASE_ANON_KEY = "sb_publishable_G-F2ZIST3iOCXYIi77N5Og_TBFdWWeu"
+SUPABASE_KEY = "sb_publishable_G-F2ZIST3iOCXYIi77N5Og_TBFdWWeu"
+TELEGRAM_BOT_TOKEN = "8773479891:AAEdB5WaInEhiRxeff4Lgwj3MzEWIkPifKY"
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-TOTAL_MARKS = 320
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-user_sessions = {}
+# ----------------------------------------------------
+# دالّات المساعدة وتوحيد النصوص العربية
+# ----------------------------------------------------
 
-def normalize_text(text: str) -> str:
+
+def normalize_arabic(text: str) -> str:
+    """تطهير وتوحيد الحروف العربية لمطابقة آلية الموقع"""
     if not text:
         return ""
-    text = re.sub(r'[أإآءئؤ]', 'ا', text)
-    text = re.sub(r'ة', 'ه', text)
-    text = re.sub(r'ى', 'ي', text)
-    text = re.sub(r'[\u064B-\u0652]', '', text)
-    return text.strip().lower()
+    text = str(text).strip()
+    text = re.sub(r"[أإآ]", "ا", text)
+    text = re.sub(r"ى", "ي", text)
+    text = re.sub(r"ة", "ه", text)
+    text = re.sub(r"[\u064B-\u0652]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
 
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        [["🔍 بحث جديد", "❓ مساعدة"]],
-        resize_keyboard=True
+
+def build_sql_like_pattern(token: str) -> str:
+    """بناء نمط البحث المخصص المطابق للواجهة"""
+    if not token:
+        return ""
+    t = token.strip()
+    if t.startswith("ال") and len(t) > 3:
+        t = t[2:]
+    t = re.sub(r"[أإآا]", "_", t)
+    t = re.sub(r"[ىي]$", "_", t)
+    t = re.sub(r"[ةه]$", "_", t)
+    return f"%{t}%"
+
+
+def calculate_percentage(total_degree) -> str:
+    """حساب النسبة المئوية بناءً على مجموع 320"""
+    try:
+        total = float(total_degree)
+        pct = (total / 320) * 100
+        return f"{pct:.1f}%"
+    except (ValueError, TypeError):
+        return "0.0%"
+
+
+def format_student_card(student: dict) -> str:
+    """تنسيق نتيجة الطالب لرسائل التليجرام"""
+    name = student.get("arabic_name", "غير محدد")
+    seat = student.get("seating_no", "---")
+    total = student.get("total_degree", 0)
+    status = student.get("student_case_desc", "ناجح")
+    pct = calculate_percentage(total)
+
+    return (
+        f"🎓 *نتيجة الثانوية العامة 2026*\n\n"
+        f"👤 *اسم الطالب:* {name}\n"
+        f"🔢 *رقم الجلوس:* `{seat}`\n"
+        f"📊 *المجموع الكلي:* {total} / 320\n"
+        f"📈 *النسبة المئوية:* {pct}\n"
+        f"📌 *الحالة:* {status}\n"
     )
 
-def get_matches_keyboard(matches):
-    buttons = [[f"👤 {item['name']}"] for item in matches]
-    buttons.append(["❌ إلغاء البحث"])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_sessions.pop(chat_id, None)
-    await update.message.reply_text(
-        "أهلاً بك! اكتب **رقم الجلوس** أو **اسم الطالب** لبدء البحث:",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+# ----------------------------------------------------
+# الاستعلام من قاعدة البيانات Supabase
+# ----------------------------------------------------
+
+
+def search_student_data(query_str: str):
+    """البحث سواء برقم الجلوس أو بالاسم"""
+    clean_query = query_str.strip()
+
+    # 1. إذا كان المدخل رقم جلوس (أرقام فقط)
+    if clean_query.isdigit():
+        try:
+            res = (
+                supabase.table("students")
+                .select("*")
+                .or_(f"seating_no.eq.{int(clean_query)},seating_no.eq.{clean_query}")
+                .execute()
+            )
+            return res.data if res.data else []
+        except Exception as e:
+            print(f"Error seating query: {e}")
+            return []
+
+    # 2. إذا كان المدخل اسماً
+    norm_query = normalize_arabic(clean_query)
+    tokens = [t for t in norm_query.split(" ") if t]
+    if not tokens:
+        return []
+
+    try:
+        db_query = supabase.table("students").select("*")
+        for token in tokens:
+            pattern = build_sql_like_pattern(token)
+            if pattern:
+                db_query = db_query.ilike("arabic_name", pattern)
+
+        res = db_query.limit(10).execute()
+        matches = res.data if res.data else []
+
+        # محاولة بحث مرنة في حال عدم وجود نتائج مطابقة تماماً
+        if not matches:
+            or_conditions = [
+                f"arabic_name.ilike.{build_sql_like_pattern(t)}"
+                for t in tokens
+                if build_sql_like_pattern(t)
+            ]
+            if or_conditions:
+                res_or = (
+                    supabase.table("students")
+                    .select("*")
+                    .or_(",".join(or_conditions))
+                    .limit(10)
+                    .execute()
+                )
+                matches = res_or.data if res_or.data else []
+
+        return matches
+    except Exception as e:
+        print(f"Error name query: {e}")
+        return []
+
+
+# ----------------------------------------------------
+# معالجات أوامر ورسائل البوت
+# ----------------------------------------------------
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "مرحباً بك في *بوابة النتائج الرسمية للثانوية العامة 2026* 🎓\n\n"
+        "يمكنك البحث بالأساليب التالية:\n"
+        "1️⃣ أرسل *رقم الجلوس* مباشرة.\n"
+        "2️⃣ أرسل *اسم الطالب* (سواء ثنائي، ثلاثي، أو رباعي).\n\n"
+        "أو استخدم الأمر /top لعرض قائمة الأوائل."
     )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "يمكنك إرسال رقم الجلوس مباشرة، أو كتابة اسم الطالب (مع التسامح مع الأخطاء الإملائية).",
-        reply_markup=get_main_keyboard()
-    )
 
-async def send_student_result(update: Update, student: dict):
-    total_score = student.get('total_score', 0) or 0
-    percentage = student.get('percentage')
-    
-    if not percentage:
-        percentage = round((total_score / TOTAL_MARKS) * 100, 2)
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """جلب قائمة الأوائل (أعلى 10 درجات)"""
+    try:
+        res = (
+            supabase.table("students")
+            .select("*")
+            .order("total_degree", desc=True)
+            .limit(10)
+            .execute()
+        )
+        top_list = res.data if res.data else []
 
-    response_text = (
-        f"🎓 **نتيجة الطالب**\n\n"
-        f"👤 **الاسم:** {student.get('name')}\n"
-        f"🔢 **رقم الجلوس:** {student.get('seat_no')}\n"
-        f"📊 **المجموع الكلي:** {total_score} من {TOTAL_MARKS}\n"
-        f"📈 **النسبة المئوية:** {percentage}%\n"
-        f"📌 **الحالة:** {student.get('status', 'ناجح')}"
-    )
+        if not top_list:
+            await update.message.reply_text("لا توجد بيانات متاحة حالياً.")
+            return
 
-    await update.message.reply_text(
-        response_text,
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
+        msg = "🏆 *أوائل الثانوية العامة 2026*\n\n"
+        for idx, student in enumerate(top_list, 1):
+            name = student.get("arabic_name", "")
+            total = student.get("total_degree", 0)
+            pct = calculate_percentage(total)
+            msg += f"{idx}. *{name}* — {total}/320 ({pct})\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text("حدث خطأ أثناء جلب قائمة الأوائل.")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip() if update.message.text else ""
-
+    text = update.message.text
     if not text:
         return
 
-    if text in ["/start", "🔍 بحث جديد", "❌ إلغاء البحث"]:
-        await start(update, context)
+    await update.message.reply_text("🔎 جاري البحث في قاعدة البيانات...")
+
+    results = search_student_data(text)
+
+    if not results:
+        await update.message.reply_text(
+            "❌ لم نتمكن من العثور على أي نتائج مطابقة.\nتأكد من كتابة الاسم أو رقم الجلوس بشكل صحيح."
+        )
         return
 
-    if text == "❓ مساعدة":
-        await help_command(update, context)
-        return
+    # إذا كانت النتيجة طالب واحد فقط
+    if len(results) == 1:
+        card = format_student_card(results[0])
+        await update.message.reply_text(card, parse_mode="Markdown")
+    else:
+        # إذا وجدت عدة نتائج بالاسم (أكثر من طالب)
+        response_text = (
+            f"🔍 تم العثور على *{len(results)}* نتائج مطابقة:\n\n"
+        )
+        for idx, student in enumerate(results[:10], 1):
+            name = student.get("arabic_name")
+            seat = student.get("seating_no")
+            total = student.get("total_degree")
+            pct = calculate_percentage(total)
+            response_text += (
+                f"{idx}. *{name}*\n   رقم الجلوس: `{seat}` | المجموع: {pct}\n\n"
+            )
 
-    if chat_id in user_sessions:
-        selected_name = text.replace("👤 ", "")
-        session_matches = user_sessions.get(chat_id, [])
-        matched_student = next((s for s in session_matches if s.get('name') == selected_name), None)
+        response_text += "💡 *ملاحظة:* للحصول على تفاصيل أعمق، ابحث برقم الجلوس المباشر للطالب."
+        await update.message.reply_text(response_text, parse_mode="Markdown")
 
-        if matched_student:
-            user_sessions.pop(chat_id, None)
-            await send_student_result(update, matched_student)
-            return
 
-    loading_msg = await update.message.reply_text("جاري البحث عن النتيجة...")
+# ----------------------------------------------------
+# التشغيل الرئيسي
+# ----------------------------------------------------
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    try:
-        # البحث برقم الجلوس
-        if text.isdigit():
-            response = supabase.table('students').select('*').eq('seat_no', int(text)).execute()
-            data = response.data
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("top", top_command))
+    app.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
+    )
 
-            await loading_msg.delete()
-
-            if not data:
-                # تجربة البحث كنص إذا كان العمود string
-                response_str = supabase.table('students').select('*').eq('seat_no', text).execute()
-                data = response_str.data
-
-            if not data:
-                await update.message.reply_text("لم يتم العثور على نتيجة برقم الجلوس هذا.", reply_markup=get_main_keyboard())
-                return
-
-            await send_student_result(update, data[0])
-
-        # البحث بالاسم
-        else:
-            clean_input = normalize_text(text)
-            first_word = clean_input.split()[0] if clean_input else ""
-
-            # استخدام ilike مستقر
-            response = supabase.table('students').select('*').ilike('name', f"%{first_word}%").limit(200).execute()
-            students = response.data
-
-            await loading_msg.delete()
-
-            if not students:
-                await update.message.reply_text("لم يتم العثور على اسم مطابق في قاعدة البيانات.", reply_markup=get_main_keyboard())
-                return
-
-            names_map = {s['name']: normalize_text(s['name']) for s in students if 'name' in s}
-            normalized_names = list(names_map.values())
-
-            best_matches = process.extract(clean_input, normalized_names, scorer=fuzz.WRatio, limit=5)
-            filtered_matches = [m for m in best_matches if m[1] >= 45]
-
-            if not filtered_matches:
-                await update.message.reply_text("لم يتم العثور على اسم قريب من المدخلات.", reply_markup=get_main_keyboard())
-                return
-
-            matched_students = []
-            for norm_name, score in filtered_matches:
-                for student in students:
-                    if normalize_text(student.get('name', '')) == norm_name and student not in matched_students:
-                        matched_students.append(student)
-
-            if len(matched_students) > 1:
-                user_sessions[chat_id] = matched_students
-                await update.message.reply_text(
-                    f"وجدت أكثر من اسم قريب من \"{text}\". اختر الاسم الصحيح:",
-                    reply_markup=get_matches_keyboard(matched_students)
-                )
-            elif len(matched_students) == 1:
-                user_sessions.pop(chat_id, None)
-                await send_student_result(update, matched_students[0])
-            else:
-                await update.message.reply_text("لم يتم العثور على نتائج متطابقة.", reply_markup=get_main_keyboard())
-
-    except Exception as e:
-        print(f"Error Details: {e}")
-        try:
-            await loading_msg.delete()
-        except:
-            pass
-        await update.message.reply_text("حدث خطأ في قاعدة البيانات، يرجى المحاولة لاحقاً.", reply_markup=get_main_keyboard())
-
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("البوت يعمل الآن...")
+    print("🤖 البوت يعمل الآن ويستقبل الرسائل...")
     app.run_polling()
-
-if __name__ == '__main__':
-    main()
