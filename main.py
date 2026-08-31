@@ -5,7 +5,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from supabase import create_client, Client
 from thefuzz import process, fuzz
 
-# البيانات الأساسية (تم وضع التوكين مباشرة)
 TELEGRAM_TOKEN = "8773479891:AAEdB5WaInEhiRxeff4Lgwj3MzEWIkPifKY"
 SUPABASE_URL = "https://ztcubxsgkspmjnuvamve.supabase.co"
 SUPABASE_ANON_KEY = "sb_publishable_G-F2ZIST3iOCXYIi77N5Og_TBFdWWeu"
@@ -90,7 +89,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in user_sessions:
         selected_name = text.replace("👤 ", "")
         session_matches = user_sessions.get(chat_id, [])
-        matched_student = next((s for s in session_matches if s['name'] == selected_name), None)
+        matched_student = next((s for s in session_matches if s.get('name') == selected_name), None)
 
         if matched_student:
             user_sessions.pop(chat_id, None)
@@ -100,11 +99,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading_msg = await update.message.reply_text("جاري البحث عن النتيجة...")
 
     try:
+        # البحث برقم الجلوس
         if text.isdigit():
-            response = supabase.table('students').select('*').eq('seat_no', text).execute()
+            response = supabase.table('students').select('*').eq('seat_no', int(text)).execute()
             data = response.data
 
             await loading_msg.delete()
+
+            if not data:
+                # تجربة البحث كنص إذا كان العمود string
+                response_str = supabase.table('students').select('*').eq('seat_no', text).execute()
+                data = response_str.data
 
             if not data:
                 await update.message.reply_text("لم يتم العثور على نتيجة برقم الجلوس هذا.", reply_markup=get_main_keyboard())
@@ -112,11 +117,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await send_student_result(update, data[0])
 
+        # البحث بالاسم
         else:
             clean_input = normalize_text(text)
             first_word = clean_input.split()[0] if clean_input else ""
 
-            response = supabase.table('students').select('*').or_(f"name.ilike.%{first_word}%,name.ilike.%{text}%").limit(300).execute()
+            # استخدام ilike مستقر
+            response = supabase.table('students').select('*').ilike('name', f"%{first_word}%").limit(200).execute()
             students = response.data
 
             await loading_msg.delete()
@@ -125,11 +132,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("لم يتم العثور على اسم مطابق في قاعدة البيانات.", reply_markup=get_main_keyboard())
                 return
 
-            names_map = {s['name']: normalize_text(s['name']) for s in students}
+            names_map = {s['name']: normalize_text(s['name']) for s in students if 'name' in s}
             normalized_names = list(names_map.values())
 
             best_matches = process.extract(clean_input, normalized_names, scorer=fuzz.WRatio, limit=5)
-            filtered_matches = [m for m in best_matches if m[1] >= 50]
+            filtered_matches = [m for m in best_matches if m[1] >= 45]
 
             if not filtered_matches:
                 await update.message.reply_text("لم يتم العثور على اسم قريب من المدخلات.", reply_markup=get_main_keyboard())
@@ -138,7 +145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             matched_students = []
             for norm_name, score in filtered_matches:
                 for student in students:
-                    if normalize_text(student['name']) == norm_name and student not in matched_students:
+                    if normalize_text(student.get('name', '')) == norm_name and student not in matched_students:
                         matched_students.append(student)
 
             if len(matched_students) > 1:
@@ -147,17 +154,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"وجدت أكثر من اسم قريب من \"{text}\". اختر الاسم الصحيح:",
                     reply_markup=get_matches_keyboard(matched_students)
                 )
-            else:
+            elif len(matched_students) == 1:
                 user_sessions.pop(chat_id, None)
                 await send_student_result(update, matched_students[0])
+            else:
+                await update.message.reply_text("لم يتم العثور على نتائج متطابقة.", reply_markup=get_main_keyboard())
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error Details: {e}")
         try:
             await loading_msg.delete()
         except:
             pass
-        await update.message.reply_text("حدث خطأ غير متوقع، حاول لاحقاً.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("حدث خطأ في قاعدة البيانات، يرجى المحاولة لاحقاً.", reply_markup=get_main_keyboard())
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
