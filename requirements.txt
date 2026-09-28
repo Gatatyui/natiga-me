@@ -1,4 +1,3 @@
-python-telegram-bot
+python-telegram-bot>=20.0
 supabase
-thefuzz
-RapidFuzz
+google-generativeai
